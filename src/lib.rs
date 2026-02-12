@@ -5,7 +5,7 @@
 //!
 //! * Rust-idiomatic: uses strong types, standard traits and other things
 //! * Compliant: implements all requirements of BIP21, including protections to not forget about
-//!              `req-`. (But see features.)
+//!   `req-`. (But see features.)
 //! * Flexible: enables parsing/serializing additional arguments not defined by BIP21
 //! * Performant: uses zero-copy deserialization and lazy evaluation wherever possible.
 //!
@@ -347,7 +347,7 @@ impl<'de> DeserializationState<'de> for EmptyState {
     }
 }
 
-impl<'a> SerializeParams for &'a NoExtras {
+impl SerializeParams for &NoExtras {
     type Key = core::convert::Infallible;
     type Value = core::convert::Infallible;
     type Iterator = core::iter::Empty<(Self::Key, Self::Value)>;
