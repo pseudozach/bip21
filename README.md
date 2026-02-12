@@ -21,6 +21,29 @@ Serialization and deserialization is inspired by `serde` with these important di
 
 The crate is `no_std` but does require `alloc`.
 
+## Composable Extras
+
+Modern BIP21 usage often requires supporting multiple parameter extensions from different sources (e.g., Lightning Network invoices, Payjoin endpoints, Silent Payments). This crate supports composing multiple `Extras` implementations using tuples, allowing each parameter set to be implemented and maintained in its own crate:
+
+```rust
+// Define your extras types (or import from other crates)
+type MyExtras = (LightningExtras, PayjoinExtras);
+
+// Parse a URI with composed extras
+let uri: Uri<'_, _, MyExtras> = uri_string.parse()?;
+
+// Access parameters from each extras type
+let lightning_invoice = uri.extras.0.lightning;
+let payjoin_endpoint = uri.extras.1.pj;
+```
+
+This eliminates the need to duplicate deserialization/serialization logic and allows you to:
+- Reuse existing, tested implementations from dependency crates
+- Compose any combination of extras as needed for your application
+- Avoid maintaining large monolithic extras implementations
+
+For more details, see the [documentation](https://docs.rs/bip21).
+
 ## Features    
 
 * `std` enables integration with `std` - mainly `std::error::Error`.

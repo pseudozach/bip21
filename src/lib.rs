@@ -5,7 +5,7 @@
 //!
 //! * Rust-idiomatic: uses strong types, standard traits and other things
 //! * Compliant: implements all requirements of BIP21, including protections to not forget about
-//!              `req-`. (But see features.)
+//!   `req-`. (But see features.)
 //! * Flexible: enables parsing/serializing additional arguments not defined by BIP21
 //! * Performant: uses zero-copy deserialization and lazy evaluation wherever possible.
 //!
@@ -16,6 +16,21 @@
 //! * Use of [`Param<'a>`] to enable lazy evaluation.
 //!
 //! The crate is `no_std` but does require `alloc`.
+//!
+//! ## Composable Extras
+//!
+//! Modern BIP21 usage often requires supporting multiple parameter extensions from different
+//! sources (e.g., Lightning Network, Payjoin, Silent Payments). This crate supports composing
+//! multiple `Extras` implementations using tuples:
+//!
+//! ```ignore
+//! // Example: Compose Lightning and Payjoin extras
+//! type MyExtras = (LightningExtras, PayjoinExtras);
+//! let uri: Uri<'_, _, MyExtras> = uri_string.parse()?;
+//! ```
+//!
+//! This allows each parameter set to be implemented and maintained in its own crate, then
+//! composed as needed downstream without duplicating deserialization/serialization logic.
 //!
 //! ## Features
 //!
@@ -53,6 +68,7 @@ use percent_encoding_rfc3986::{PercentDecode, PercentDecodeError};
 #[cfg(feature = "non-compliant-bytes")]
 use either::Either;
 use core::convert::{TryFrom, TryInto};
+use core::fmt;
 use bitcoin::address::NetworkValidation;
 
 pub use de::{DeserializeParams, DeserializationState, DeserializationError};
@@ -331,7 +347,7 @@ impl<'de> DeserializationState<'de> for EmptyState {
     }
 }
 
-impl<'a> SerializeParams for &'a NoExtras {
+impl SerializeParams for &NoExtras {
     type Key = core::convert::Infallible;
     type Value = core::convert::Infallible;
     type Iterator = core::iter::Empty<(Self::Key, Self::Value)>;
@@ -341,12 +357,172 @@ impl<'a> SerializeParams for &'a NoExtras {
     }
 }
 
+// Composable extras implementation for tuples.
+// This allows combining multiple Extras implementations.
+
+/// Error type for combining two different extras types.
+///
+/// This is used when composing extras with tuples. When either the left or right
+/// extras type returns an error during deserialization, it's wrapped in this enum.
+///
+/// # Examples
+///
+/// ```ignore
+/// type ComposedExtras = (LightningExtras, PayjoinExtras);
+/// // If deserialization fails, you'll get an EitherError wrapping the specific error
+/// ```
+#[derive(Debug, Clone)]
+pub enum EitherError<L, R> {
+    /// Error from the left (first) extras type.
+    Left(L),
+    /// Error from the right (second) extras type.
+    Right(R),
+}
+
+impl<L: fmt::Display, R: fmt::Display> fmt::Display for EitherError<L, R> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            EitherError::Left(err) => write!(f, "{}", err),
+            EitherError::Right(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<L: std::error::Error + 'static, R: std::error::Error + 'static> std::error::Error for EitherError<L, R> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            EitherError::Left(err) => Some(err),
+            EitherError::Right(err) => Some(err),
+        }
+    }
+}
+
+/// Deserialization state for a tuple of two extras types.
+///
+/// This is used internally to handle deserialization of composed extras.
+/// When you compose extras using a tuple like `(ExtrasA, ExtrasB)`, this state
+/// manages the deserialization process for both types.
+///
+/// The state routes each parameter to the appropriate extras type based on
+/// which one recognizes it via `is_param_known`.
+#[derive(Debug, Default)]
+pub struct TupleState<S1, S2> {
+    state1: S1,
+    state2: S2,
+}
+
+impl<L, R> DeserializationError for (L, R)
+where
+    L: DeserializationError,
+    R: DeserializationError,
+{
+    type Error = EitherError<L::Error, R::Error>;
+}
+
+impl<'de, L, R> DeserializeParams<'de> for (L, R)
+where
+    L: DeserializeParams<'de>,
+    R: DeserializeParams<'de>,
+{
+    type DeserializationState = TupleState<L::DeserializationState, R::DeserializationState>;
+}
+
+impl<'de, L, R> DeserializationState<'de> for TupleState<L, R>
+where
+    L: DeserializationState<'de>,
+    R: DeserializationState<'de>,
+{
+    type Value = (L::Value, R::Value);
+
+    fn is_param_known(&self, key: &str) -> bool {
+        self.state1.is_param_known(key) || self.state2.is_param_known(key)
+    }
+
+    fn deserialize_temp(&mut self, key: &str, value: Param<'_>) -> Result<de::ParamKind, <Self::Value as DeserializationError>::Error> {
+        if self.state1.is_param_known(key) {
+            self.state1.deserialize_temp(key, value).map_err(EitherError::Left)
+        } else if self.state2.is_param_known(key) {
+            self.state2.deserialize_temp(key, value).map_err(EitherError::Right)
+        } else {
+            Ok(de::ParamKind::Unknown)
+        }
+    }
+
+    fn deserialize_borrowed(&mut self, key: &'de str, value: Param<'de>) -> Result<de::ParamKind, <Self::Value as DeserializationError>::Error> {
+        if self.state1.is_param_known(key) {
+            self.state1.deserialize_borrowed(key, value).map_err(EitherError::Left)
+        } else if self.state2.is_param_known(key) {
+            self.state2.deserialize_borrowed(key, value).map_err(EitherError::Right)
+        } else {
+            Ok(de::ParamKind::Unknown)
+        }
+    }
+
+    fn finalize(self) -> Result<Self::Value, <Self::Value as DeserializationError>::Error> {
+        let left = self.state1.finalize().map_err(EitherError::Left)?;
+        let right = self.state2.finalize().map_err(EitherError::Right)?;
+        Ok((left, right))
+    }
+}
+
+/// Iterator that chains two serialization iterators.
+///
+/// This is used to combine parameters from two different extras types
+/// when serializing a composed URI. It first yields all parameters from
+/// the first iterator, then all parameters from the second.
+///
+/// The `iter2` field is `Option<I2>` to track exhaustion state: it starts
+/// as `Some` and becomes `None` once all items are yielded to avoid repeated
+/// polling of an exhausted iterator.
+///
+/// # Type Parameters
+///
+/// * `I1` - The first iterator type
+/// * `I2` - The second iterator type
+pub struct ChainedIterator<I1, I2> {
+    iter1: I1,
+    iter2: Option<I2>,
+}
+
+impl<K, V, I1, I2> Iterator for ChainedIterator<I1, I2>
+where
+    I1: Iterator<Item = (K, V)>,
+    I2: Iterator<Item = (K, V)>,
+{
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.iter1.next() {
+            Some(item) => Some(item),
+            None => self.iter2.as_mut().and_then(|iter| iter.next()),
+        }
+    }
+}
+
+impl<'a, L, R> SerializeParams for &'a (L, R)
+where
+    &'a L: SerializeParams,
+    &'a R: SerializeParams<Key = <&'a L as SerializeParams>::Key, Value = <&'a L as SerializeParams>::Value>,
+{
+    type Key = <&'a L as SerializeParams>::Key;
+    type Value = <&'a L as SerializeParams>::Value;
+    type Iterator = ChainedIterator<<&'a L as SerializeParams>::Iterator, <&'a R as SerializeParams>::Iterator>;
+
+    fn serialize_params(self) -> Self::Iterator {
+        ChainedIterator {
+            iter1: (&self.0).serialize_params(),
+            iter2: Some((&self.1).serialize_params()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::Uri;
-    use alloc::string::ToString;
+    use alloc::string::{String, ToString};
     use alloc::borrow::Cow;
-    use core::convert::TryInto;
+    use core::convert::{TryFrom, TryInto};
 
     fn check_send_sync<T: Send + Sync>() {}
 
@@ -426,5 +602,186 @@ mod tests {
         assert!(uri.amount.is_none());
         assert!(uri.label.is_none());
         assert!(uri.message.is_none());
+    }
+
+    // Tests for composable extras
+
+    // Example extras types for testing
+    #[derive(Debug, Default, Clone, PartialEq)]
+    struct LightningExtras {
+        lightning: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct LightningState {
+        lightning: Option<String>,
+    }
+
+    impl crate::de::DeserializationError for LightningExtras {
+        type Error = core::convert::Infallible;
+    }
+
+    impl crate::de::DeserializeParams<'_> for LightningExtras {
+        type DeserializationState = LightningState;
+    }
+
+    impl<'de> crate::de::DeserializationState<'de> for LightningState {
+        type Value = LightningExtras;
+
+        fn is_param_known(&self, key: &str) -> bool {
+            key == "lightning"
+        }
+
+        fn deserialize_temp(&mut self, key: &str, value: crate::Param<'_>) -> Result<crate::de::ParamKind, <Self::Value as crate::de::DeserializationError>::Error> {
+            if key == "lightning" {
+                self.lightning = Some(String::try_from(value).expect("failed to convert lightning parameter to string"));
+                Ok(crate::de::ParamKind::Known)
+            } else {
+                Ok(crate::de::ParamKind::Unknown)
+            }
+        }
+
+        fn finalize(self) -> Result<Self::Value, <Self::Value as crate::de::DeserializationError>::Error> {
+            Ok(LightningExtras {
+                lightning: self.lightning,
+            })
+        }
+    }
+
+    impl<'a> crate::ser::SerializeParams for &'a LightningExtras {
+        type Key = &'static str;
+        type Value = alloc::string::String;
+        type Iterator = alloc::vec::IntoIter<(Self::Key, Self::Value)>;
+
+        fn serialize_params(self) -> Self::Iterator {
+            let mut params = alloc::vec::Vec::new();
+            if let Some(ref lightning) = self.lightning {
+                params.push(("lightning", lightning.clone()));
+            }
+            params.into_iter()
+        }
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq)]
+    struct PayjoinExtras {
+        pj: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct PayjoinState {
+        pj: Option<String>,
+    }
+
+    impl crate::de::DeserializationError for PayjoinExtras {
+        type Error = core::convert::Infallible;
+    }
+
+    impl crate::de::DeserializeParams<'_> for PayjoinExtras {
+        type DeserializationState = PayjoinState;
+    }
+
+    impl<'de> crate::de::DeserializationState<'de> for PayjoinState {
+        type Value = PayjoinExtras;
+
+        fn is_param_known(&self, key: &str) -> bool {
+            key == "pj"
+        }
+
+        fn deserialize_temp(&mut self, key: &str, value: crate::Param<'_>) -> Result<crate::de::ParamKind, <Self::Value as crate::de::DeserializationError>::Error> {
+            if key == "pj" {
+                self.pj = Some(String::try_from(value).expect("failed to convert pj parameter to string"));
+                Ok(crate::de::ParamKind::Known)
+            } else {
+                Ok(crate::de::ParamKind::Unknown)
+            }
+        }
+
+        fn finalize(self) -> Result<Self::Value, <Self::Value as crate::de::DeserializationError>::Error> {
+            Ok(PayjoinExtras {
+                pj: self.pj,
+            })
+        }
+    }
+
+    impl<'a> crate::ser::SerializeParams for &'a PayjoinExtras {
+        type Key = &'static str;
+        type Value = alloc::string::String;
+        type Iterator = alloc::vec::IntoIter<(Self::Key, Self::Value)>;
+
+        fn serialize_params(self) -> Self::Iterator {
+            let mut params = alloc::vec::Vec::new();
+            if let Some(ref pj) = self.pj {
+                params.push(("pj", pj.clone()));
+            }
+            params.into_iter()
+        }
+    }
+
+    #[test]
+    fn compose_two_extras() {
+        // Test parsing with composed extras
+        let input = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?lightning=lnbc1&pj=https://example.com";
+        let uri = input.parse::<Uri<'_, _, (LightningExtras, PayjoinExtras)>>()
+            .unwrap()
+            .require_network(bitcoin::Network::Bitcoin)
+            .unwrap();
+        
+        assert_eq!(uri.address.to_string(), "1andreas3batLhQa2FawWjeyjCqyBzypd");
+        assert_eq!(uri.extras.0.lightning, Some("lnbc1".to_string()));
+        assert_eq!(uri.extras.1.pj, Some("https://example.com".to_string()));
+    }
+
+    #[test]
+    fn compose_extras_serialization() {
+        // Test serialization with composed extras
+        let address: bitcoin::Address<bitcoin::address::NetworkUnchecked> = "1andreas3batLhQa2FawWjeyjCqyBzypd".parse().unwrap();
+        let address = address.require_network(bitcoin::Network::Bitcoin).unwrap();
+        let lightning_extras = LightningExtras {
+            lightning: Some("lnbc1".to_string()),
+        };
+        let payjoin_extras = PayjoinExtras {
+            pj: Some("https://example.com".to_string()),
+        };
+        
+        let uri = Uri::with_extras(address, (lightning_extras, payjoin_extras));
+        let uri_string = uri.to_string();
+        
+        assert!(uri_string.contains("lightning=lnbc1"));
+        assert!(uri_string.contains("pj=https"));
+    }
+
+    #[test]
+    fn compose_extras_with_no_extras() {
+        // Test composing one extras with NoExtras
+        let input = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?lightning=lnbc1";
+        let uri = input.parse::<Uri<'_, _, (LightningExtras, crate::NoExtras)>>()
+            .unwrap()
+            .require_network(bitcoin::Network::Bitcoin)
+            .unwrap();
+        
+        assert_eq!(uri.address.to_string(), "1andreas3batLhQa2FawWjeyjCqyBzypd");
+        assert_eq!(uri.extras.0.lightning, Some("lnbc1".to_string()));
+    }
+
+    #[test]
+    fn compose_extras_required_param() {
+        // Test that required params work with composed extras
+        let input = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?req-unknown=value";
+        let result = input.parse::<Uri<'_, _, (LightningExtras, PayjoinExtras)>>();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn compose_extras_optional_unknown_param() {
+        // Test that optional unknown params are ignored with composed extras
+        let input = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?lightning=lnbc1&unknown=value";
+        let uri = input.parse::<Uri<'_, _, (LightningExtras, PayjoinExtras)>>()
+            .unwrap()
+            .require_network(bitcoin::Network::Bitcoin)
+            .unwrap();
+        
+        assert_eq!(uri.address.to_string(), "1andreas3batLhQa2FawWjeyjCqyBzypd");
+        assert_eq!(uri.extras.0.lightning, Some("lnbc1".to_string()));
+        assert_eq!(uri.extras.1.pj, None);
     }
 }
