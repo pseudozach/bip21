@@ -472,6 +472,10 @@ where
 /// when serializing a composed URI. It first yields all parameters from
 /// the first iterator, then all parameters from the second.
 ///
+/// The `iter2` field is `Option<I2>` to track exhaustion state: it starts
+/// as `Some` and becomes `None` once all items are yielded to avoid repeated
+/// polling of an exhausted iterator.
+///
 /// # Type Parameters
 ///
 /// * `I1` - The first iterator type
@@ -630,7 +634,7 @@ mod tests {
 
         fn deserialize_temp(&mut self, key: &str, value: crate::Param<'_>) -> Result<crate::de::ParamKind, <Self::Value as crate::de::DeserializationError>::Error> {
             if key == "lightning" {
-                self.lightning = Some(String::try_from(value).unwrap());
+                self.lightning = Some(String::try_from(value).expect("failed to convert lightning parameter to string"));
                 Ok(crate::de::ParamKind::Known)
             } else {
                 Ok(crate::de::ParamKind::Unknown)
@@ -685,7 +689,7 @@ mod tests {
 
         fn deserialize_temp(&mut self, key: &str, value: crate::Param<'_>) -> Result<crate::de::ParamKind, <Self::Value as crate::de::DeserializationError>::Error> {
             if key == "pj" {
-                self.pj = Some(String::try_from(value).unwrap());
+                self.pj = Some(String::try_from(value).expect("failed to convert pj parameter to string"));
                 Ok(crate::de::ParamKind::Known)
             } else {
                 Ok(crate::de::ParamKind::Unknown)
